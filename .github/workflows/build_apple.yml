@@ -1,0 +1,158 @@
+name: Build
+
+on:
+  push:
+  schedule:
+    - cron: '0 0 * * 0'
+
+
+env:
+#  if: (github.event_name == 'schedule')
+#  GITHUB_ENV: https://docs.github.com/en/actions/learn-github-actions/environment-variables#about-environment-variables
+  FF_VERSION: ${{ vars.FF_VER }} # TODO: latest release if triggered by schedule
+  LLVM_VER: ${{ vars.LLVM_VER }}
+  LLVM_VER_DEFAULT: 20
+  NINJA_STATUS: '[%f/%t %e %r]'
+  SF_PW_MAPPED: ${{ secrets.SF_PW }}
+  SF_USER_MAPPED: ${{ secrets.SF_USER }}
+  VC_LTL_VER: ${{ vars.VC_LTL_VER }}
+
+jobs:
+  Apple:
+    # See: https://docs.github.com/en/actions/configuring-and-managing-workflows/configuring-a-workflow#configuring-a-build-matrix
+    runs-on: self-hosted
+    env:
+      TARGET_OS: ${{ matrix.target }}
+      CONFIG_SUFFIX: -${{ matrix.config }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [default,lite,lite-lto] # lto reduce about 300KB for lite build
+        target: [macOS,iOS,iOSSimulator,visionOS,visionOSSimulator,tvOS,tvOSSimulator,macCatalyst]
+        exclude:
+          - config: default
+            target: iOS
+          - config: default
+            target: iOSSimulator
+          - config: lite
+            target: iOSSimulator
+          - config: default
+            target: macCatalyst
+          - config: lite
+            target: macCatalyst
+          - config: default
+            target: tvOS
+          - config: default
+            target: tvOSSimulator
+          - config: lite
+            target: tvOSSimulator
+          - config: default
+            target: visionOS
+          - config: lite # llvm-ar-17 merged visionOS lto libs has wrong contents (/,//,*.o/)
+            target: visionOS
+          - config: default
+            target: visionOSSimulator
+          - config: lite
+            target: visionOSSimulator
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Xcode
+      run: sudo xcode-select -s /Applications/Xcode_${{ vars.XCODE }}.app
+    - name: Create Build Environment
+      shell: bash
+      env:
+        DEVTOOLS_CACHE_HIT: ${{ steps.devtools-cache.outputs.cache-hit }}
+        EXTERNAL_DEP_CACHE_HIT: ${{ steps.external-dep-cache.outputs.cache-hit }}
+      run: ./tools/ci-before-build.sh
+    - name: Configure and Build
+      # Use a bash shell so we can use the same syntax for environment variable
+      # access regardless of the host operating system
+      shell: bash
+      run: |
+        export FFSRC=$PWD/ffmpeg-${FF_VERSION}
+        [[ "${TARGET_OS}" == "iOS" || "${TARGET_OS}" == "tvOS"* || "${TARGET_OS}" == "xr"* || "${TARGET_OS}" == "vision"* ]]  && export USER_OPT="--enable-wolfssl"
+        [[ "${TARGET_OS}" == "macOS" ]] && export USER_OPT="--enable-libshaderc"
+        ./avbuild.sh ${TARGET_OS}
+    - name: Make SDK
+      shell: bash
+      run: ./tools/ci-after-build.sh
+    - name: Archieve SDK
+      uses: actions/upload-artifact@v4
+      with:
+        name: ffmpeg-${{ env.FF_VERSION }}-${{ env.TARGET_OS }}-${{ matrix.config }}
+        path: ffmpeg-*.tar.xz
+
+  FFmpeg-xcframework:
+    runs-on: self-hosted
+    needs: [Apple]
+    steps:
+    - name: Download iOS
+      uses: actions/download-artifact@v4
+      with:
+        name: ffmpeg-${{ env.FF_VERSION }}-iOS-lite-lto
+    - name: Download iOSSimulator
+      uses: actions/download-artifact@v4
+      with:
+        name: ffmpeg-${{ env.FF_VERSION }}-iOSSimulator-lite-lto
+    - name: Download tvOS
+      uses: actions/download-artifact@v4
+      with:
+        name: ffmpeg-${{ env.FF_VERSION }}-tvOS-lite-lto
+    - name: Download tvOSSimulator
+      uses: actions/download-artifact@v4
+      with:
+        name: ffmpeg-${{ env.FF_VERSION }}-tvOSSimulator-lite-lto
+    - name: Download visionOS
+      uses: actions/download-artifact@v4
+      with:
+        name: ffmpeg-${{ env.FF_VERSION }}-visionOS-lite-lto
+    - name: Download visionOSSimulator
+      uses: actions/download-artifact@v4
+      with:
+        name: ffmpeg-${{ env.FF_VERSION }}-visionOSSimulator-lite-lto
+    - name: Download macOS
+      uses: actions/download-artifact@v4
+      with:
+        name: ffmpeg-${{ env.FF_VERSION }}-macOS-lite-lto
+    - name: Download macCatalyst
+      uses: actions/download-artifact@v4
+      with:
+        name: ffmpeg-${{ env.FF_VERSION }}-macCatalyst-lite-lto
+    - name: Gen FFmpeg.framework
+      run: |
+        for OS in iOS iOSSimulator tvOS tvOSSimulator visionOS visionOSSimulator; do
+          tar xvf ffmpeg-${{ env.FF_VERSION }}-${OS}-lite-lto-shared.tar.xz
+          cd ffmpeg-${{ env.FF_VERSION }}-${OS}-lite-lto
+          ./dylib2framework.sh lib/libffmpeg.dylib
+          cd -
+        done
+        for OS in macOS macCatalyst; do
+          tar xvf ffmpeg-${{ env.FF_VERSION }}-${OS}-lite-lto.tar.xz
+          cd ffmpeg-${{ env.FF_VERSION }}-${OS}-lite-lto
+          ./dylib2framework.sh lib/libffmpeg.dylib
+          cd -
+        done
+    - name: Gen FFmpeg.xcframework
+      env:
+        export XZ_OPT: "-T0 -9e" # -9e. -8/9 will disable mt?
+      run: |
+        for OS in macOS macCatalyst iOS iOSSimulator tvOS tvOSSimulator visionOS visionOSSimulator; do
+          ARGS+=" -framework ffmpeg-${{ env.FF_VERSION }}-${OS}-lite-lto/lib/FFmpeg.framework"
+        done
+        xcodebuild -create-xcframework $ARGS -output FFmpeg.xcframework
+        codesign --force  --sign - --deep --timestamp FFmpeg.xcframework
+        mkdir -p out
+        mv -v FFmpeg.xcframework ffmpeg-${{ env.FF_VERSION }}-iOS-lite-lto/{README.txt,COPYING*,Changelog,include} out
+        cd out
+        gtar Jcvf ../FFmpeg.xcframework-${{ env.FF_VERSION }}-lite.tar.xz *
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: FFmpeg.xcframework-${{ env.FF_VERSION }}-lite
+        path: FFmpeg.xcframework-${{ env.FF_VERSION }}-lite.tar.xz
+    # - name: Upload to SourceForge
+    #   if: (github.event_name != 'pull_request')
+    #   shell: bash
+    #   run:  |
+    #     brew install hudochenkov/sshpass/sshpass
+    #     sshpass -p $SF_PW_MAPPED scp -o StrictHostKeyChecking=no FFmpeg.xcframework-${{ env.FF_VERSION }}-lite.tar.xz $SF_USER_MAPPED,avbuild@frs.sourceforge.net:/home/frs/project/a/av/avbuild/xcframework/
